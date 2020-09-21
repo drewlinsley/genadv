@@ -1,0 +1,58 @@
+# PSVRT experiment setup
+dataset:
+    - "psvrt"
+model_name: 
+    - "resnet18"
+    - "resnet34"
+    - "resnet50"
+    - "densenet121"
+    - "densenet161"
+    - "densenet201"
+    - "vgg11_bn"
+    - "vgg13_bn"
+    - "vgg16_bn"
+siamese:
+    - True
+    - False
+siamese_version:
+    - "subtract"
+task:
+    - "sd"
+    - "sr"
+epochs:
+    - 1
+inner_steps:
+    - 0.3
+outer_steps:
+    - 100
+alpha:
+    - 1.
+beta:
+    - 0.
+batch_size:
+    - 512
+inner_lr:
+    - 0.01
+outer_lr:
+    - 0.01
+outer_batch_size_multiplier:
+    - 1
+optimizer:
+    - "Adam"
+pretrained:
+    - False
+adv_version:
+    - "entropy"
+amsgrad:
+    - True
+wn:
+    - True
+inner_loop_criterion:
+    - True
+outer_loop_criterion:
+    - False
+inner_loop_nonfirst_criterion:
+    - False
+gen_tb:
+    - False
+

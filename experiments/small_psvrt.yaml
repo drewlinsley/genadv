@@ -1,0 +1,58 @@
+dataset:
+    - "psvrt"
+model_name: 
+    - "resnet18"
+siamese:
+    - True
+    - False
+siamese_version:
+    - "subtract"
+task:
+    - "sd"
+    - "sr"
+epochs:
+    - 1
+inner_steps:
+    - 0.1
+outer_steps:
+    - 10000
+alpha:
+    - 1.
+beta:
+    - 0.1
+batch_size:
+    - 256
+inner_lr:
+    - 0.01
+outer_lr:
+    - 0.01
+outer_batch_size_multiplier:
+    - 1
+optimizer:
+    - "Adam"
+pretrained:
+    - False
+adv_version:
+    - "entropy"
+amsgrad:
+    - True
+wn:
+    - False
+gen_tb:
+    - True
+inner_loop_criterion:
+    - True
+outer_loop_criterion:
+    - False
+inner_loop_nonfirst_criterion:
+    - False
+loss:
+    - "kl"
+save_i_params:
+    - 1000
+inner_lr_first:
+    - 0.01
+inner_lr_nonfirst:
+    - 0.00001
+regularization:
+    - "l2"

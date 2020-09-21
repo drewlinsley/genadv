@@ -1,0 +1,804 @@
+import math
+import torch
+from torch import nn
+# import torch.nn.functional as F
+from utils import gumbel_softmax, sample_gumbel
+from torch.distributions.relaxed_categorical import RelaxedOneHotCategorical
+from torch.distributions.multivariate_normal import MultivariateNormal
+from torch.distributions.normal import Normal
+from torch.distributions.half_normal import HalfNormal
+from torch.distributions.relaxed_bernoulli import RelaxedBernoulli
+from resources.constrained_normal import Normal as CNormal
+# from torch.distributions.constraint_registry import transform_to
+# from torch.distributions import transforms
+# from torch.distributions import transform_to
+# from torch.distributions import constraints
+import utils
+
+
+# Fixed dataset params
+CATEGORICAL = False
+MAX_OBJECTS = 10
+MAX_OBJECT_SIZE = 10
+MIN_OBJECTS = 2
+MIN_OBJECT_SIZE = 1
+MIN_DYNAMIC_RANGE = 2
+OBJECT_MARGIN = 7
+# NORM_MEAN = torch.tensor([0., 0., 0.]).float()
+# NORM_STD = torch.tensor([1., 1., 1.]).float()
+NORM_MEAN = torch.tensor([0.485, 0.456, 0.406]).reshape(1, 3, 1, 1)
+NORM_STD = torch.tensor([0.229, 0.224, 0.225]).reshape(1, 3, 1, 1)
+
+# Initialize dataset lambdas
+SPATIAL_SCALE = torch.tensor(8).float()
+MINIMUM_SPATIAL_SCALE = torch.tensor(8.).float()
+DYNAMIC_RANGE_SCALE = torch.tensor(1.).float()  # Relaxed bernoulli
+
+# Use categorical
+if CATEGORICAL:
+    OBJECT_NUMBER_LOC = torch.zeros(MIN_OBJECTS).float() + .1 / MIN_OBJECTS
+    OBJECT_NUMBER_LOC[0] = 1. - OBJECT_NUMBER_LOC.sum() + OBJECT_NUMBER_LOC[0]  # noqa
+    OBJECT_SIZE_LOC = torch.zeros(MAX_OBJECT_SIZE).float() + .1 / MAX_OBJECT_SIZE  # noqa
+    OBJECT_SIZE_LOC[0] = 1. - OBJECT_SIZE_LOC.sum() + OBJECT_SIZE_LOC[0]
+    OBJECT_NUMBER_SCALE = torch.zeros([])
+    OBJECT_SIZE_SCALE = torch.zeros([])
+else:
+    # Use gaussian
+    OBJECT_NUMBER_LOC = torch.tensor(2.).float()  # TODO: Set to 0
+    OBJECT_SIZE_LOC = torch.tensor(1.).float()  # TODO: Set to 0
+    OBJECT_NUMBER_SCALE = torch.tensor(0.75).float()
+    OBJECT_SIZE_SCALE = torch.tensor(0.75).float()
+
+
+class Generator(nn.Module):
+    def __init__(
+            self,
+            dataset,
+            img_size,
+            device,
+            num_classes=2,
+            task='sd',
+            siamese=False,
+            wn=False,
+            batch_grad=False,
+            one_object_size_per_batch=False,
+            embedding_grad=False,
+            gumbel_type='dist',
+            categorical=CATEGORICAL,
+            norm_mean=NORM_MEAN,
+            norm_std=NORM_STD,
+            spatial_scale=SPATIAL_SCALE,
+            minimum_spatial_scale=MINIMUM_SPATIAL_SCALE,
+            object_number_loc=OBJECT_NUMBER_LOC,
+            object_number_scale=OBJECT_NUMBER_SCALE,
+            object_size_loc=OBJECT_SIZE_LOC,
+            object_size_scale=OBJECT_SIZE_SCALE,
+            dynamic_range_scale=DYNAMIC_RANGE_SCALE,
+            min_objects=MIN_OBJECTS,
+            min_object_size=MIN_OBJECT_SIZE,
+            min_dynamic_range=MIN_DYNAMIC_RANGE,
+            object_margin=OBJECT_MARGIN,
+            max_object_size=MAX_OBJECT_SIZE,
+            max_objects=MAX_OBJECTS):
+        """Differentiable PSVRT generator.
+           So far, generative model assumes that images are governed
+           by four independent random variables:
+           1. Object location: bivarate gaussian
+           2. Object number: categorical
+           3. Object size:
+           4. Dynamic range: """
+        super(Generator, self).__init__()
+        self.dataset = dataset
+        self.img_size = img_size
+        self.num_classes = num_classes
+        self.min_objects = min_objects  # Target # of same objs
+        self.max_objects = max_objects
+        self.device = device
+        self.batch_grad = batch_grad
+        self.minimum_spatial_scale = minimum_spatial_scale
+        self.siamese = siamese
+        self.object_margin = object_margin  # Min distance btwn objs
+        self.min_dynamic_range = min_dynamic_range
+        self.one_object_size_per_batch = one_object_size_per_batch
+        self.min_object_size = min_object_size
+        self.max_object_size = max_object_size
+        self.task = task.lower()
+        self.wn = wn
+        self.embedding_grad = embedding_grad
+        self.norm_mean = norm_mean.to(self.device)
+        self.norm_std = norm_std.to(self.device)
+        if self.siamese:
+            self.reshape = (1, 3, 1, 1, 1)
+            self.norm_mean = self.norm_mean.reshape(self.reshape)
+            self.norm_std = self.norm_std.reshape(self.reshape)
+        else:
+            self.reshape = (1, 3, 1, 1)
+
+        # Specify the distributions
+        self.dists = []
+        if CATEGORICAL:
+            self.dists += [{
+                'name': 'num_objects',
+                'family': 'categorical',
+                'lambda_0': object_number_loc,
+                'lambda_0_scale': object_number_scale,
+                'return_sampler': True,
+                'trainable': True,
+            }]
+            self.dists += [{
+                'name': 'object_size',
+                'family': 'categorical',
+                'lambda_0': object_size_loc,
+                'lambda_0_scale': object_size_scale,
+                'return_sampler': True,
+                'trainable': True,
+            }]
+        else:
+            self.dists += [{
+                'name': 'num_objects',
+                # 'family': 'relaxed_bernoulli',
+                'family': 'abs_normal',
+                # 'family': 'categorical',
+                'lambda_0': object_number_loc,
+                'lambda_0_scale': object_number_scale,
+                'return_sampler': True,
+                'trainable': True,
+            }]
+            self.dists += [{
+                'name': 'object_size',
+                'family': 'abs_normal',
+                # 'family': 'categorical',
+                'lambda_0': object_size_loc,
+                'lambda_0_scale': object_size_scale,
+                'return_sampler': True,
+                'trainable': True,
+            }]
+        self.dists += [{
+            'name': 'dynamic_range',
+            'family': 'normal',
+            'lambda_0': 0.,
+            'lambda_0_scale': dynamic_range_scale,
+            'return_sampler': True,
+            'trainable': False,
+        }]
+        self.dists += [{
+            'name': 'object_location',
+            'trainable': True,
+            # 'family': 'gaussian',
+            'family': 'cnormal',
+            'return_sampler': False,
+            'lambda_0': [float(self.img_size / 2.), float(self.img_size / 2.)],
+            'lambda_0_scale': spatial_scale
+        }]
+        if gumbel_type == 'dist':
+            self.gumbel_fun = self.gumbel_softmax_dist
+        else:
+            self.gumbel_fun = gumbel_softmax
+        self.check_dists()
+        self.init_challenge()
+
+    def check_dists(self):
+        """Simple parameter checking for dists."""
+        for di in self.dists:
+            keys = list(di.keys())
+            assert 'name' in keys, 'Need a name for your dist.'
+            assert 'trainable' in keys, 'Need a trainable for your dist.'
+            assert 'family' in keys, 'Need a family for your dist.'
+            assert 'lambda_0' in keys, 'Need a lambda_0 for your dist.'
+            assert 'return_sampler' in keys, 'Need a return_sampler for your dist.'  # noqa
+
+    def _test(self):
+        """Add a test here."""
+        return
+
+    def normalize_weights(self, name, prop):
+        """Apply weight normalization."""
+        g_attr_name = '{}_{}'.format(name, '{}_g'.format(prop))
+        v_attr_name = '{}_{}'.format(name, '{}_v'.format(prop))
+        g = getattr(self, g_attr_name)
+        v = getattr(self, v_attr_name)
+        return v * (g / torch.norm(v)).expand_as(v)
+
+    def init_wns(self, w):
+        """Initialize weight normed weights."""
+        g = torch.norm(w)
+        v = w / g.expand_as(w)
+        return g, v
+
+    def st_op(self, y):
+        """Apply ST operator."""
+        shape = y.size()
+        _, ind = y.max(dim=-1)
+        # y_hard = torch.zeros_like(y).scatter_(-1, ind, 1.0)
+        ind = ind.unsqueeze(-1)
+        y_hard = torch.zeros_like(y).scatter_(-1, ind, 1.0)
+        y_hard = y_hard.view(*shape)
+        y = (y_hard - y).detach() + y
+        return y
+
+    def gumbel_softmax_dist(
+            self,
+            param,
+            name,
+            temperature=1e-1,
+            hard=True,
+            sample_size=()):
+        """ST gumbel with pytorch distributions."""
+        gumbel = RelaxedOneHotCategorical(temperature, logits=param)
+        y = gumbel.rsample(sample_size)
+        if hard:
+            # One-hot the y
+            y = self.st_op(y)
+        return y
+
+    def init_challenge(self, mu=1e-4, sigma=1e-4, pi=1e-4, eps=1e-4):
+        """Initialize the perturbation vector r.
+        We want to learn r, which perturbs the fixed random parameters
+        \lambda_0. To do this, we will initialize r as \lambda_0, and
+        use a generative loss to ensure r is minimally different than
+        \lambda_0.
+
+        Initialization is lambda_0 + alpha * distribution_noise.
+        """
+        for idx, row in enumerate(self.dists):
+            trainable = row['trainable']
+            # We have lambda_0 (for center/maybe scale)
+            if not torch.is_tensor(row['lambda_0']):
+                # If this is not a torch tensor, convert it
+                row['lambda_0'] = torch.tensor(row['lambda_0'])
+
+            # Send lambda_0 center to device
+            row['lambda_0'] = row['lambda_0'].to(self.device)
+            if (
+                    row['family'] == 'gaussian' or
+                    row['family'] == 'normal' or
+                    row['family'] == 'cnormal' or
+                    row['family'] == 'abs_normal'):
+                if not torch.is_tensor(row['lambda_0_scale']):
+                    # If this is not a torch tensor, convert it
+                    row['lambda_0_scale'] = torch.is_tensor(row['lambda_0_scale'])  # noqa
+                # Send lambda_0 scale to device
+                self.dists[idx]['lambda_0_scale'] = row['lambda_0_scale'].to(self.device)  # noqa
+
+                # Initilize challenge center/scale
+                lambda_r = row['lambda_0'] + torch.randn_like(row['lambda_0']) * mu  # noqa
+                lambda_r_scale = row['lambda_0_scale'] + torch.randn_like(row['lambda_0_scale']) * sigma  # noqa
+
+                # Also add the r parameters to a list
+                if self.wn:
+                    raise RuntimeError('Weightnorm not working for psvrt.')
+                    lambda_r_g, lambda_r_v = self.init_wns(lambda_r)
+                    lambda_r_scale_g, lambda_r_scale_v = self.init_wns(lambda_r_scale)  # noqa
+                    # Also add the r parameters to a list
+                    attr_name = '{}_{}'.format(row['name'], 'center_g')
+                    setattr(self, attr_name, nn.Parameter(lambda_r_g, requires_grad=trainable))  # noqa
+                    attr_name = '{}_{}'.format(row['name'], 'center_v')
+                    setattr(self, attr_name, nn.Parameter(lambda_r_v, requires_grad=trainable))  # noqa
+                    attr_name = '{}_{}'.format(row['name'], 'scale_g')
+                    setattr(self, attr_name, nn.Parameter(lambda_r_scale_g, requires_grad=trainable))  # noqa
+                    attr_name = '{}_{}'.format(row['name'], 'scale_v')
+                    setattr(self, attr_name, nn.Parameter(lambda_r_scale_v, requires_grad=trainable))  # noqa
+                else:
+                    # Also add the r parameters to a list
+                    attr_name = '{}_{}'.format(row['name'], 'center')
+                    setattr(self, attr_name, nn.Parameter(lambda_r, requires_grad=trainable))  # noqa
+                    attr_name = '{}_{}'.format(row['name'], 'scale')
+                    setattr(self, attr_name, nn.Parameter(lambda_r_scale, requires_grad=trainable))  # noqa
+            elif row['family'] == 'half_normal':
+                if not torch.is_tensor(row['lambda_0_scale']):
+                    # If this is not a torch tensor, convert it
+                    row['lambda_0_scale'] = torch.is_tensor(row['lambda_0_scale'])  # noqa
+                # Send lambda_0 scale to device
+                self.dists[idx]['lambda_0_scale'] = row['lambda_0_scale'].to(self.device)  # noqa
+
+                # Initilize challenge center/scale
+                lambda_r_scale = row['lambda_0_scale'] + torch.abs(torch.randn_like(row['lambda_0_scale'])) * sigma  # noqa
+
+                # Also add the r parameters to a list
+                if self.wn:
+                    raise RuntimeError('Weightnorm not working for psvrt.')
+                    lambda_r_scale_g, lambda_r_scale_v = self.init_wns(
+                        lambda_r_scale)
+                    # Also add the r parameters to a list
+                    attr_name = '{}_{}'.format(row['name'], 'scale_g')
+                    setattr(self, attr_name, nn.Parameter(lambda_r_scale_g, requires_grad=trainable))  # noqa
+                    attr_name = '{}_{}'.format(row['name'], 'scale_v')
+                    setattr(self, attr_name, nn.Parameter(lambda_r_scale_v, requires_grad=trainable))  # noqa
+                else:
+                    # Also add the r parameters to a list
+                    attr_name = '{}_{}'.format(row['name'], 'scale')
+                    setattr(self, attr_name, nn.Parameter(lambda_r_scale, requires_grad=trainable))  # noqa
+            elif row['family'] == 'relaxed_bernoulli':
+                # Handle pi of categorical dist (var/temp is hardcoded)
+                soft_log_probs = torch.log(row['lambda_0'] + eps)  # Don't save
+                lambda_r = soft_log_probs  #  + torch.rand_like(soft_log_probs) * pi  # noqa
+                lambda_r = lambda_r.to(self.device)  # noqa
+
+                # Also add the r parameters to a list
+                if self.wn:
+                    raise RuntimeError('Weightnorm not working for psvrt.')
+                    lambda_r_g, lambda_r_v = self.init_wns(lambda_r)
+                    lambda_r_scale_g, lambda_r_scale_v = self.init_wns(
+                        lambda_r_scale)
+                    # Also add the r parameters to a list
+                    attr_name = '{}_{}'.format(row['name'], 'center_g')
+                    setattr(self, attr_name, nn.Parameter(lambda_r_g, requires_grad=trainable))  # noqa
+                    attr_name = '{}_{}'.format(row['name'], 'center_v')
+                    setattr(self, attr_name, nn.Parameter(lambda_r_v, requires_grad=trainable))  # noqa
+                else:
+                    # Also add the r parameters to a list
+                    attr_name = '{}_{}'.format(row['name'], 'center')
+                    setattr(self, attr_name, nn.Parameter(lambda_r, requires_grad=trainable))  # noqa
+            elif row['family'] == 'categorical':
+                # Handle pi of categorical dist (var/temp is hardcoded)
+                soft_log_probs = torch.log(row['lambda_0'] + eps)  # Don't save
+                lambda_r = soft_log_probs + sample_gumbel(soft_log_probs) * pi  # noqa
+                lambda_r = lambda_r.to(self.device)  # noqa
+
+                # Also add the r parameters to a list
+                if self.wn:
+                    raise RuntimeError('Weightnorm not working for psvrt.')
+                    lambda_r_g, lambda_r_v = self.init_wns(lambda_r)
+                    lambda_r_scale_g, lambda_r_scale_v = self.init_wns(
+                        lambda_r_scale)
+                    # Also add the r parameters to a list
+                    attr_name = '{}_{}'.format(row['name'], 'center_g')
+                    setattr(self, attr_name, nn.Parameter(lambda_r_g, requires_grad=trainable))  # noqa
+                    attr_name = '{}_{}'.format(row['name'], 'center_v')
+                    setattr(self, attr_name, nn.Parameter(lambda_r_v, requires_grad=trainable))  # noqa
+                else:
+                    # Also add the r parameters to a list
+                    attr_name = '{}_{}'.format(row['name'], 'center')
+                    setattr(self, attr_name, nn.Parameter(lambda_r, requires_grad=trainable))  # noqa
+            else:
+                raise NotImplementedError
+
+    def rejection_sampling(
+            self,
+            object_margin,
+            margin_offset,
+            object_locations,
+            max_rejections,
+            num_objects,
+            gau):
+        """Select samples with rejection sampling."""
+        assert object_locations is not None, \
+            'Needs a list of previous object locations.'
+        assert object_margin is not None, \
+            'No sampling margin provided.'
+        # Adjust coordinates so objects don't overlap
+        working = True
+        margin = object_margin + margin_offset  # noqa
+        count = 0
+        while working:
+            sample = gau.rsample()
+            if num_objects == 0:
+                return sample
+            ds = torch.abs(  # cityblock distance
+                sample - torch.stack(object_locations, 0)).sum(-1)
+            working = torch.any(ds < margin)
+            count += 1
+            if count > max_rejections:
+                raise RuntimeError('Failed to sample images.')
+        return sample
+
+    def sample_lambda0_r(
+            self,
+            d,
+            batch_size,
+            offset=0,
+            object_locations=None,
+            object_margin=None,
+            num_objects=None,
+            gau=None,
+            max_rejections=1000,
+            margin_offset=2):
+        """Sample dataset parameters perturbed by r."""
+        name = d['name']
+        family = d['family']
+        attr_name = '{}_{}'.format(name, 'center')
+        if self.wn:
+            lambda_r = self.normalize_weights(name=name, prop='center')
+        else:
+            lambda_r = getattr(self, attr_name)
+        parameters = []
+        if family == 'gaussian':
+            attr_name = '{}_{}'.format(name, 'scale')
+            if self.wn:
+                lambda_r_scale = self.normalize_weights(
+                    name=name,
+                    prop='scale')
+            else:
+                lambda_r_scale = getattr(self, attr_name)
+            # lambda_r = transform_to(constraints.greater_than(
+            #     1.))(lambda_r)
+            # lambda_r_scale = transform_to(constraints.greater_than(
+            #     self.minimum_spatial_scale))(lambda_r_scale)
+            # TODO: Add constraint function here
+            # w=module.weight.data
+            # w=w.clamp(0.5,0.7)
+            # module.weight.data=w
+
+            if gau is None:
+                gau = MultivariateNormal(
+                    loc=lambda_r,
+                    covariance_matrix=lambda_r_scale)
+            if d['return_sampler']:
+                return gau
+            if name == 'object_location':
+                if not len(object_locations):
+                    return gau.rsample(), gau
+                else:
+                    parameters = self.rejection_sampling(
+                        object_margin=object_margin,
+                        margin_offset=margin_offset,
+                        object_locations=object_locations,
+                        max_rejections=max_rejections,
+                        num_objects=num_objects,
+                        gau=gau)
+            else:
+                raise NotImplementedError(name)
+        elif family == 'normal':
+            attr_name = '{}_{}'.format(name, 'scale')
+            if self.wn:
+                lambda_r_scale = self.normalize_weights(
+                    name=name,
+                    prop='scale')
+            else:
+                lambda_r_scale = getattr(self, attr_name)
+            nor = Normal(loc=lambda_r, scale=lambda_r_scale)
+            if d['return_sampler']:
+                return nor
+            elif name == 'object_location':
+                # nor.arg_constraints['scale'] = constraints.greater_than(self.minimum_spatial_scale)  # noqa
+                if not len(object_locations):
+                    return nor.rsample(), nor
+                else:
+                    parameters = self.rejection_sampling(
+                        object_margin=object_margin,
+                        margin_offset=margin_offset,
+                        object_locations=object_locations,
+                        max_rejections=max_rejections,
+                        num_objects=num_objects,
+                        gau=nor)
+            else:
+                for idx in range(batch_size):
+                    parameters.append(nor.rsample())
+        elif family == 'cnormal':
+            attr_name = '{}_{}'.format(name, 'scale')
+            if self.wn:
+                lambda_r_scale = self.normalize_weights(
+                    name=name,
+                    prop='scale')
+            else:
+                lambda_r_scale = getattr(self, attr_name)
+
+            # Explicitly clamp the scale!
+            lambda_r_scale = torch.clamp(lambda_r_scale, self.minimum_spatial_scale, 999.)
+            nor = CNormal(loc=lambda_r, scale=lambda_r_scale)
+            if d['return_sampler']:
+                return nor
+            elif name == 'object_location':
+                # nor.arg_constraints['scale'] = constraints.greater_than(self.minimum_spatial_scale)  # noqa
+                if not len(object_locations):
+                    return nor.rsample(), nor
+                else:
+                    parameters = self.rejection_sampling(
+                        object_margin=object_margin,
+                        margin_offset=margin_offset,
+                        object_locations=object_locations,
+                        max_rejections=max_rejections,
+                        num_objects=num_objects,
+                        gau=nor)
+            else:
+                for idx in range(batch_size):
+                    parameters.append(nor.rsample())
+        elif family == 'abs_normal':
+            attr_name = '{}_{}'.format(name, 'scale')
+            if self.wn:
+                lambda_r_scale = self.normalize_weights(
+                    name=name,
+                    prop='scale')
+            else:
+                lambda_r_scale = getattr(self, attr_name)
+            # lambda_r = transform_to(Normal.arg_constraints['loc'])(lambda_r)
+            # lambda_r_scale = transform_to(Normal.arg_constraints['scale'])(lambda_r_scale)  # noqa
+            # lambda_r = transforms.AbsTransform()(lambda_r)
+            # lambda_r_scale = transforms.AbsTransform()(lambda_r_scale)
+            lambda_r = torch.abs(lambda_r)
+            lambda_r_scale = torch.abs(lambda_r_scale)
+            nor = Normal(loc=lambda_r, scale=lambda_r_scale)
+            if d['return_sampler']:
+                return nor
+            else:
+                parameters = nor.rsample([batch_size])
+        elif family == 'half_normal':
+            attr_name = '{}_{}'.format(name, 'scale')
+            if self.wn:
+                lambda_r_scale = self.normalize_weights(
+                    name=name,
+                    prop='scale')
+            else:
+                lambda_r_scale = getattr(self, attr_name)
+            nor = HalfNormal(scale=lambda_r_scale)
+            if d['return_sampler']:
+                return nor
+            else:
+                parameters = nor.rsample([batch_size])
+        elif family == 'categorical':
+            if d['return_sampler']:
+                gum = RelaxedOneHotCategorical(1e-1, logits=lambda_r)
+                return gum
+                # return lambda sample_size: self.argmax(self.gumbel_fun(lambda_r, name=name)) + offset   # noqa
+            for _ in range(batch_size):
+                parameters.append(self.argmax(self.gumbel_fun(lambda_r, name=name)) + offset)  # noqa Use default temperature -> max
+        elif family == 'relaxed_bernoulli':
+            bern = RelaxedBernoulli(temperature=1e-1, logits=lambda_r)
+            if d['return_sampler']:
+                return bern
+            else:
+                parameters = bern.rsample([batch_size])
+        else:
+            raise NotImplementedError(
+                '{} not implemented in sampling.'.format(family))
+        return parameters
+
+    def argmax(self, one_hot):
+        """Differentiable argmax trick."""
+        oh_shape = one_hot.shape
+        if len(oh_shape) == 2:
+            inds = torch.arange(
+                1,
+                oh_shape[1] + 1,
+                dtype=one_hot.dtype,
+                requires_grad=True).reshape(1, -1).to(self.device)
+            return (inds.repeat(oh_shape[0], 1) * one_hot).max(-1)[0] - 1
+        elif len(oh_shape) == 3:
+            inds = torch.arange(
+                1,
+                oh_shape[1] + 1,
+                dtype=one_hot.dtype,
+                requires_grad=True).reshape(1, 1, -1).to(self.device)
+            return (inds.repeat(
+                oh_shape[0], inds.shape[-1], 1) * one_hot).max(-1)[0] - 1
+        elif len(oh_shape) == 1:
+            return (torch.arange(1, oh_shape[0] + 1, dtype=one_hot.dtype, requires_grad=True).to(self.device) * one_hot).max()[0] - 1  # noqa
+        else:
+            raise NotImplementedError(len(oh_shape))
+
+    def set_trainable(self):
+        """Set the data generator to train appropriate variables."""
+        self.batch_grad = True
+
+    def set_not_trainable(self):
+        """Set the data generator to train appropriate variables."""
+        self.batch_grad = False
+
+    def sample_batch(
+            self,
+            batch_size,
+            target_rng=255.):
+        """
+        Sample a batch.
+
+        batch_size: (int) size of batch
+
+        Returns
+
+        batch:  (tensor)
+        labels: (tensor)
+        params: (dict) the sampled parameters for images in this batch
+
+        Hold object properties constant for now across +/- samples. Fix later.
+        """
+        if not torch.is_tensor(target_rng):
+            target_rng = torch.tensor(target_rng).float()
+        if self.siamese:
+            image_batch = torch.zeros((
+                batch_size,
+                self.img_size,
+                self.img_size,
+                2), requires_grad=self.batch_grad)
+        else:
+            image_batch = torch.zeros((
+                batch_size,
+                self.img_size,
+                self.img_size), requires_grad=self.batch_grad)
+        image_batch = image_batch.to(self.device)
+        label_batch = torch.zeros(
+            (batch_size, 1), dtype=torch.long, device=self.device)
+        num_object_ps = self.sample_lambda0_r(
+            batch_size=batch_size,
+            d=self.dists[0])
+        num_objects = num_object_ps.rsample([batch_size])
+        if self.dists[0]['family'] == 'categorical':
+            num_objects = self.st_op(num_objects)
+            obj_cat = torch.arange(
+                1,
+                num_objects.shape[-1] + 1,
+                dtype=num_objects.dtype,
+                requires_grad=True).to(self.device)
+            obj_cat = obj_cat.reshape(1, -1, 1, 1)
+            obj_cat = obj_cat.repeat(batch_size, 1, 1, 1)
+            num_objects = (obj_cat * num_objects.reshape(
+                batch_size, self.max_objects, 1, 1)).sum(1, keepdims=True)
+            num_objects = torch.abs(
+                torch.clamp(-(obj_cat - self.min_objects - num_objects), 0, 1))
+        elif self.dists[0]['family'] == 'relaxed_bernoulli':
+            num_objects = num_object_ps.rsample([batch_size])
+            num_objects = self.st_op(num_objects)
+            num_objects[:, :self.min_objects] = 1.
+        elif (
+                'gaussian' in self.dists[0]['family'] or
+                'normal' in self.dists[0]['family']):
+            num_objects = (
+                num_objects.round() - num_objects).detach() + num_objects
+            num_objects = torch.clamp(
+                num_objects.reshape(-1, 1, 1, 1),
+                self.min_objects,
+                self.max_objects)
+            obj_cat = torch.arange(
+                1,
+                self.max_objects + 1,
+                dtype=num_objects.dtype,
+                requires_grad=True).to(self.device)
+            obj_cat = obj_cat.reshape(1, -1, 1, 1)
+            obj_cat = obj_cat.repeat(batch_size, 1, 1, 1)
+            num_objects = torch.abs(torch.clamp(-(obj_cat - self.min_objects + 1 - num_objects), 0, 1))  # noqa
+        dynamic_range_ps = self.sample_lambda0_r(
+            batch_size=batch_size,
+            d=self.dists[2],
+            offset=self.min_dynamic_range)  # Dist object... used to have + 2
+        dynamic_range = torch.tanh(
+            dynamic_range_ps.rsample((
+                batch_size, self.max_objects, self.img_size, self.img_size)))
+        object_size_ps = self.sample_lambda0_r(
+            batch_size=batch_size,
+            d=self.dists[1],
+            offset=1)
+        if self.one_object_size_per_batch:
+            object_sizes = object_size_ps.rsample([batch_size])
+            if self.dists[1]['family'] == 'categorical':
+                object_sizes = self.argmax(self.st_op(object_sizes))
+        else:
+            object_sizes = object_size_ps.rsample(
+                [batch_size, self.max_objects])
+            if self.dists[1]['family'] == 'categorical':
+                object_sizes = self.st_op(object_sizes)
+                object_sizes = self.argmax(object_sizes)
+            elif (
+                    'gaussian' in self.dists[1]['family'] or
+                    'normal' in self.dists[0o1]['family']):
+                object_sizes = (
+                    object_sizes.round() -
+                    object_sizes).detach() + object_sizes
+        object_sizes = torch.clamp(
+            object_sizes, self.min_object_size, self.max_object_size)
+        object_radiuses = object_sizes
+        y_range = torch.arange(0, self.img_size).to(self.device)  # v1
+        x_range = torch.arange(0, self.img_size).to(self.device)  # v1
+        yys, xxs = torch.meshgrid(y_range, x_range)  # v1
+        yys = yys.unsqueeze(0).repeat(self.max_objects, 1, 1).float()  # v1
+        xxs = xxs.unsqueeze(0).repeat(self.max_objects, 1, 1).float()  # v1
+        for bidx in range(batch_size):
+            # Sample size of objects
+            object_radius = object_radiuses[bidx]
+            lab = (torch.rand(1) > .5).float()
+            if lab == 1 and not self.one_object_size_per_batch:
+                object_radius[1] = object_radius[0]  # Copy the sizes
+
+            # Create canvases
+            # y_range = torch.arange(0, self.img_size).to(self.device)
+            # x_range = torch.arange(0, self.img_size).to(self.device)
+            # yys, xxs = torch.meshgrid(y_range, x_range)  # noqa
+            # yys = yys.unsqueeze(0).repeat(self.max_objects, 1, 1).float()
+            # xxs = xxs.unsqueeze(0).repeat(self.max_objects, 1, 1).float()
+            object_locations, coords = [], []
+            ilc = 0
+            for il in range(self.max_objects):
+                # Sample object locations
+                show_obj = num_objects[bidx][il].reshape(())
+                if il == 0:
+                    loc, gau = self.sample_lambda0_r(
+                        batch_size=batch_size,
+                        d=self.dists[3],
+                        object_locations=object_locations,
+                        num_objects=show_obj,
+                        object_margin=object_radius[ilc])
+                else:
+                    loc = self.sample_lambda0_r(
+                        batch_size=batch_size,
+                        d=self.dists[3],
+                        gau=gau,
+                        object_locations=object_locations,
+                        num_objects=show_obj,
+                        object_margin=object_radius[ilc])
+                if show_obj == 1:
+                    # Use loc for rejection sampling if we really need it
+                    object_locations.append(loc.detach())
+                coords.append(loc)
+                if self.one_object_size_per_batch:
+                    ilc += 1
+            coords = torch.stack(coords, 0)
+            coords = (torch.floor(coords) - coords).detach() + coords
+            # Clip coors so they don't go off screen
+            tos = object_radius + 1  # * 2
+            if self.one_object_size_per_batch:
+                hw_mins = torch.tensor([tos, tos]).to(self.device)
+                hw_maxs = torch.tensor(
+                    [self.img_size - tos, self.img_size - tos]).to(self.device)
+            else:
+                hw_mins = torch.cat(
+                    (tos.reshape(-1, 1), tos.reshape(-1, 1)), 1)
+                hw_maxs = torch.ones_like(hw_mins) * self.img_size - hw_mins
+            coords = torch.max(coords, hw_mins)
+            coords = torch.min(coords, hw_maxs)
+            by = coords[:, 0].reshape(self.max_objects, 1, 1)
+            bx = coords[:, 1].reshape(self.max_objects, 1, 1)
+            obj_d = torch.pow(yys - by, 2) + torch.pow(xxs - bx, 2)
+            if self.one_object_size_per_batch:
+                obj_mask = torch.clamp(
+                    ((object_radius.reshape(
+                        1, 1, 1) + 1) - obj_d), 0, 1)
+            else:
+                obj_mask = torch.clamp(
+                    ((object_radius.reshape(
+                        self.max_objects, 1, 1) + 1) - obj_d), 0, 1)
+            obj = obj_mask * dynamic_range[bidx]
+            if lab == 1:
+                q_idx = torch.nonzero(obj[0])  # Query
+                t_idx = torch.nonzero(obj[1])  # Target
+                same_tex = dynamic_range[bidx, 0, q_idx[:, 0], q_idx[:, 1]]
+                obj[1, t_idx[:, 0], t_idx[:, 1]] = same_tex
+
+            # Mask to only show num_objects locations
+            if self.dists[0]['family'] == 'categorical':
+                obj = obj * num_objects[bidx]
+            else:
+                obj = obj * num_objects[bidx].reshape(
+                    self.max_objects, 1, 1)
+
+            # Aggregate the batch
+            if self.siamese:
+                image_batch[bidx, ..., 0] = obj[0]
+                image_batch[bidx, ..., 1] = obj[1:].sum(0)
+            else:
+                image_batch[bidx] = obj.sum(0)
+
+            # Change task to SR if requested
+            if self.task == 'sr':
+                masked_coords = coords.detach() * num_objects[bidx].detach().squeeze(-1)  # noqa
+                masked_coords = masked_coords[torch.nonzero(masked_coords.sum(-1))]  # noqa
+                masked_coords = masked_coords.reshape(-1, 2)
+                es, vs = torch.eig(utils.cov(masked_coords), eigenvectors=True)
+                # theta = torch.atan2(v[1, 0], v[0, 0]) * (180. / math.pi)
+                sorted_es = torch.argsort(
+                    es[:, 0], dim=0, descending=True)  # Only real part
+                vs = vs[:, sorted_es]  # Column vectors
+                theta = torch.atan2(
+                    torch.abs(vs[1, 0]), vs[0, 0]) * (180. / math.pi)
+                lab = 0
+                if theta >= 45 and theta < 135 or theta >= 225 and theta < 315:
+                    lab = 1  # what is the elegant way of doing this ^^
+            label_batch[bidx] = lab
+
+        # Hardcode the normalization
+        image_batch = torch.repeat_interleave(
+            image_batch.unsqueeze(1), 3, dim=1)
+        image_batch = (image_batch + 1.) / 2.
+        image_batch = image_batch - self.norm_mean
+        image_batch = image_batch / self.norm_std
+
+        # image_batch = utils.normalize_fun(
+        #     image_batch,
+        #     reshape=self.reshape,
+        #     mean=self.norm_mean,
+        #     std=self.norm_std)
+        # # Convert labels to one-hot
+        # y = torch.eye(self.num_classes).to(self.device)
+        # label_batch = y[label_batch].squeeze(1).long()
+        del yys  # v1
+        del xxs  # v1
+        del y_range, x_range
+        return image_batch, label_batch.squeeze()
+

@@ -1,0 +1,9 @@
+DROP TABLE IF EXISTS experiments
+DROP TABLE IF EXISTS gradients
+DROP TABLE IF EXISTS results
+DROP TABLE IF EXISTS meta_results
+
+CREATE TABLE experiments (_id bigserial primary key, dataset varchar, inner_lr float, outer_lr float, inner_steps float, inner_steps_first float, outer_steps float, epochs float, alpha float, beta float, batch_size int, outer_batch_size_multiplier int, model_name varchar, optimizer varchar, adv_version varchar, siamese boolean, siamese_version varchar, pretrained boolean, amsgrad boolean, task varchar, dt varchar, is_processing boolean DEFAULT False, finished boolean DEFAULT False, wn boolean, inner_loop_criterion boolean, outer_loop_criterion boolean, inner_loop_nonfirst_criterion boolean, gen_tb boolean DEFAULT False, loss varchar, save_i_params int, inner_lr_first float, inner_lr_nonfirst float, regularization varchar)
+CREATE TABLE gradients (_id bigserial primary key, dataset varchar, inner_lr float, outer_lr float, inner_steps float, outer_steps float, epochs float, alpha float, beta float, batch_size int, outer_batch_size_multiplier int, model_name varchar, optimizer varchar, adv_version varchar, siamese boolean, siamese_version varchar, pretrained boolean, amsgrad boolean, task varchar, dt varchar, is_processing boolean DEFAULT False, finished boolean DEFAULT False, wn boolean, inner_loop_criterion boolean, outer_loop_criterion boolean, inner_loop_nonfirst_criterion boolean, file_path varchar, loss varchar)
+CREATE TABLE results (_id bigserial primary key, experiment_id int, inner_loss float, outer_loss float, inner_loop_steps float, outer_loop_steps float, params json, net_loss float)
+CREATE TABLE meta_results (_id bigserial primary key, experiment_id int, meta json)

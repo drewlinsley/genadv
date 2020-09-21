@@ -1,0 +1,15 @@
+__pycache__
+*~*
+*.log
+*.pyc
+*.npy
+*.npz
+db/credentials.py
+*.swp
+*.png
+runs/
+ccv_runs/
+env/
+*.pdf
+*.pth
+
